@@ -179,6 +179,9 @@ class AsyncSemaphore:
         """
         Acquire a permit if one is immediately available, without blocking.
         Returns True if a permit was acquired.
+
+        Like `release()`, this requires `setup()` to have run, which any
+        prior `acquire()` call ensures.
         """
         if self._backend == "trio":
             try:
