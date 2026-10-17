@@ -191,7 +191,8 @@ async def test_h11_timeout_during_response() -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("cancel_waiter", [False, True])
-async def test_h2_queued_request_after_stream_limit_decrease(cancel_waiter: bool) -> None:
+@pytest.mark.parametrize("close_before_settings", [False, True])
+async def test_h2_queued_request_after_stream_limit_decrease(cancel_waiter: bool, close_before_settings: bool) -> None:
     origin = httpcore2.Origin(b"https", b"example.com", 443)
     stream = httpcore2.AsyncMockStream(
         [
@@ -235,7 +236,7 @@ async def test_h2_queued_request_after_stream_limit_decrease(cancel_waiter: bool
             async with conn.stream("GET", "https://example.com/a") as response_a:
 
                 async def trace(name: str, info: dict[str, typing.Any]) -> None:
-                    if name == "http2.receive_remote_settings.started":
+                    if name == "http2.receive_remote_settings.started" and not close_before_settings:
                         await response_a.aclose()
                         await anyio.wait_all_tasks_blocked()
 
@@ -244,11 +245,15 @@ async def test_h2_queued_request_after_stream_limit_decrease(cancel_waiter: bool
                         task_group.start_soon(fetch, conn)
                         await anyio.wait_all_tasks_blocked()
                         assert await response_a.aread() == b"response a"
+                        if close_before_settings:
+                            await response_a.aclose()
 
                         iterator = response_b.aiter_stream()
                         assert await anext(iterator) == b"response b"
                         await anyio.wait_all_tasks_blocked()
-                        assert statuses == []
+                        if not close_before_settings:
+                            assert statuses == []
+                        expected_statuses = statuses.copy() if cancel_waiter else [200]
                         if cancel_waiter:
                             waiter_scope.cancel()
                             await anyio.wait_all_tasks_blocked()
@@ -256,7 +261,7 @@ async def test_h2_queued_request_after_stream_limit_decrease(cancel_waiter: bool
                             assert chunk == b""
                         await response_b.aclose()
 
-            assert statuses == ([] if cancel_waiter else [200])
+            assert statuses == expected_statuses
             response = await conn.request("GET", "https://example.com/reused")
             assert response.status == 200
             assert conn.is_idle()
