@@ -348,7 +348,6 @@ class HTTP2Connection(ConnectionInterface):
                 for event in events:
                     if isinstance(event, h2.events.RemoteSettingsChanged):
                         with Trace("receive_remote_settings", logger, request) as trace:
-                            self._receive_remote_settings_change(event)
                             trace.return_value = event
 
                     elif isinstance(
@@ -377,17 +376,16 @@ class HTTP2Connection(ConnectionInterface):
             )
             if new_max_streams and new_max_streams != self._max_streams:
                 # Never wait for permits while holding the read lock.
-                with self._state_lock:
-                    while new_max_streams > self._max_streams:
-                        if self._max_streams_deficit > 0:
-                            self._max_streams_deficit -= 1
-                        else:
-                            self._max_streams_semaphore.release()
-                        self._max_streams += 1
-                    while new_max_streams < self._max_streams:
-                        if not self._max_streams_semaphore.acquire_if_available():
-                            self._max_streams_deficit += 1
-                        self._max_streams -= 1
+                while new_max_streams > self._max_streams:
+                    if self._max_streams_deficit > 0:
+                        self._max_streams_deficit -= 1
+                    else:
+                        self._max_streams_semaphore.release()
+                    self._max_streams += 1
+                while new_max_streams < self._max_streams:
+                    if not self._max_streams_semaphore.acquire_if_available():
+                        self._max_streams_deficit += 1
+                    self._max_streams -= 1
 
     def _response_closed(self, stream_id: int) -> None:
         with self._state_lock:
@@ -441,7 +439,13 @@ class HTTP2Connection(ConnectionInterface):
             self._connection_error = True
             raise exc
 
-        events: list[h2.events.Event] = self._h2_state.receive_data(data)
+        # Apply settings and stream admission limits atomically.
+        with ShieldCancellation():
+            with self._state_lock:
+                events: list[h2.events.Event] = self._h2_state.receive_data(data)
+                for event in events:
+                    if isinstance(event, h2.events.RemoteSettingsChanged):
+                        self._receive_remote_settings_change(event)
 
         return events
 
