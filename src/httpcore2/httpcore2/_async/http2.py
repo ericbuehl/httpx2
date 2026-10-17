@@ -105,8 +105,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 # its max_concurrent_streams value
                 self._max_streams = 1
 
-                # Permits revoked by a MAX_CONCURRENT_STREAMS decrease that were
-                # still held by in-flight streams, retired in `_response_closed`.
+                # Revoked permits still held by active or queued requests.
                 self._max_streams_deficit = 0
 
                 local_settings_max_streams = self._h2_state.local_settings.max_concurrent_streams
@@ -115,7 +114,14 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 for _ in range(local_settings_max_streams - self._max_streams):
                     await self._max_streams_semaphore.acquire()
 
-        await self._max_streams_semaphore.acquire()
+        # A queued request may receive a permit just before the limit drops.
+        while True:
+            await self._max_streams_semaphore.acquire()
+            with AsyncShieldCancellation():
+                async with self._state_lock:
+                    if not self._max_streams_deficit:
+                        break
+                    self._max_streams_deficit -= 1
 
         try:
             stream_id = self._h2_state.get_next_available_stream_id()
@@ -370,14 +376,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 self._h2_state.local_settings.max_concurrent_streams,
             )
             if new_max_streams and new_max_streams != self._max_streams:
-                # We're currently holding the read lock, and permits are only
-                # released once a response has been closed, which requires the
-                # read lock. So blocking on an acquire here deadlocks whenever
-                # more streams are in flight than the new limit allows. Instead
-                # we take only the permits that are immediately available, and
-                # book the rest as a deficit that `_response_closed` retires.
-                # The state lock keeps the deficit accounting consistent with
-                # `_response_closed`.
+                # Never wait for permits while holding the read lock.
                 async with self._state_lock:
                     while new_max_streams > self._max_streams:
                         if self._max_streams_deficit > 0:
